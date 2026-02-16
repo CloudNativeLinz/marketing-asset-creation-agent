@@ -1,173 +1,278 @@
+// Command generate is a CLI tool that generates/edits images using the
+// Azure OpenAI image-edits endpoint.
+//
+// Usage:
+//
+//	go run ./cmd/generate -p PROMPT -i IMAGE [-b BACKGROUND] [-s SIZE]
+//
+// Required:
+//
+//	-p  The text prompt for image generation/editing
+//	-i  The input (foreground) image file
+//
+// Optional:
+//
+//	-b  Background image file. When provided, both images are sent to the
+//	    API so the model can composite the foreground onto the background.
+//	-s  Image size (default: 1024x1024)
+//
+// The output file is auto-generated from the foreground image name with
+// "_generated" appended.
+// Example: input "assets/cat.png" → output "assets/cat_generated.png"
 package main
 
 import (
-	"context"
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"flag"
 	"fmt"
-	"log"
+	"io"
+	"mime"
+	"mime/multipart"
+	"net/http"
+	"net/textproto"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
-	"sync"
-
-	copilot "github.com/github/copilot-sdk/go"
+	"time"
 )
 
-// waitForResponse registers an event handler and sends a message, collecting the
-// full assistant response. It uses the streaming event approach to avoid the
-// internal SendAndWait timeout.
-func waitForResponse(session *copilot.Session, prompt string) (string, error) {
-	var mu sync.Mutex
-	var finalContent string
-	done := make(chan struct{})
-	errCh := make(chan error, 1)
+// Azure resource configuration – keep in sync with the shell script.
+const (
+	resourceHost = "cloudnativelinz-poland-resource.openai.azure.com"
+	deployment   = "gpt-image-1.5"
+	apiVersion   = "2025-04-01-preview"
+)
 
-	unsubscribe := session.On(func(event copilot.SessionEvent) {
-		switch event.Type {
-		case copilot.AssistantMessageDelta:
-			if event.Data.DeltaContent != nil {
-				fmt.Print(*event.Data.DeltaContent)
-			}
-		case copilot.AssistantMessage:
-			mu.Lock()
-			if event.Data.Content != nil {
-				finalContent = *event.Data.Content
-			}
-			mu.Unlock()
-		case copilot.SessionIdle:
-			close(done)
-		case copilot.SessionError:
-			msg := "unknown session error"
-			if event.Data.Content != nil {
-				msg = *event.Data.Content
-			}
-			errCh <- fmt.Errorf("session error: %s", msg)
-		}
-	})
-	defer unsubscribe()
+// imageEditResponse represents the JSON payload returned by the Azure
+// OpenAI /images/edits endpoint.
+type imageEditResponse struct {
+	Data []struct {
+		B64JSON string `json:"b64_json"`
+	} `json:"data"`
+	Error *apiError `json:"error,omitempty"`
+}
 
-	ctx := context.Background()
-	_, err := session.Send(ctx, copilot.MessageOptions{
-		Prompt: prompt,
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to send message: %w", err)
-	}
-
-	select {
-	case <-done:
-		mu.Lock()
-		defer mu.Unlock()
-		return finalContent, nil
-	case err := <-errCh:
-		return "", err
-	}
+type apiError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code"`
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <speaker-name>\n", os.Args[0])
-		os.Exit(1)
+	prompt := flag.String("p", "", "The text prompt for image generation/editing (required)")
+	inputImage := flag.String("i", "", "The foreground input image file (required)")
+	bgImage := flag.String("b", "", "Background image file (optional)")
+	size := flag.String("s", "1024x1024", "Image size")
+	flag.Parse()
+
+	if *prompt == "" {
+		fatalf("Error: Prompt is required (-p)\nUsage: generate -p PROMPT -i IMAGE [-b BACKGROUND] [-s SIZE]")
+	}
+	if *inputImage == "" {
+		fatalf("Error: Input image is required (-i)\nUsage: generate -p PROMPT -i IMAGE [-b BACKGROUND] [-s SIZE]")
+	}
+	if _, err := os.Stat(*inputImage); os.IsNotExist(err) {
+		fatalf("Error: Input image not found: %s", *inputImage)
+	}
+	if *bgImage != "" {
+		if _, err := os.Stat(*bgImage); os.IsNotExist(err) {
+			fatalf("Error: Background image not found: %s", *bgImage)
+		}
 	}
 
-	speakerName := strings.Join(os.Args[1:], " ")
-	fmt.Printf("🎤 Building marketing profile for: %s\n\n", speakerName)
+	outputFile := deriveOutputPath(*inputImage)
 
-	// Create the Copilot SDK client
-	client := copilot.NewClient(nil)
-	defer client.ForceStop()
+	fmt.Println("Generating image with Azure OpenAI...")
+	fmt.Printf("Prompt:  %s\n", *prompt)
+	if *bgImage != "" {
+		fmt.Printf("Background: %s\n", *bgImage)
+	}
+	fmt.Printf("Foreground: %s\n", *inputImage)
+	fmt.Printf("Output:  %s\n", outputFile)
+	fmt.Printf("Size:    %s\n\n", *size)
 
-	// ─── Step 1: Research the speaker using "marketing-speaker-specialst" ───
-	fmt.Println("📋 Step 1: Researching speaker with marketing-speaker-specialst agent...")
-	fmt.Println(strings.Repeat("─", 60))
+	// Ensure the output directory exists.
+	if err := os.MkdirAll(filepath.Dir(outputFile), 0o755); err != nil {
+		fatalf("Error creating output directory: %v", err)
+	}
 
-	ctx := context.Background()
-
-	speakerSession, err := client.CreateSession(ctx, &copilot.SessionConfig{
-		Streaming: true,
-		CustomAgents: []copilot.CustomAgentConfig{
-			{
-				Name:        "marketing-speaker-specialst",
-				DisplayName: "Marketing Speaker Specialist",
-				Description: "Researches and builds comprehensive speaker profiles including background, expertise, notable talks, and public presence.",
-				Prompt: `You are a marketing speaker specialist. Your job is to research speakers and build comprehensive profiles about them.
-When given a speaker name, research and compile:
-- Full name and professional title
-- Background and career highlights
-- Areas of expertise and key topics
-- Notable talks, presentations, or publications
-- Public presence (social media, websites, blogs)
-- Speaking style and audience engagement approach
-- Key quotes or memorable statements
-- Relevant achievements and awards
-
-Provide a well-structured, detailed speaker profile that can be used by marketing teams.`,
-			},
-		},
-	})
+	token, err := getAzureToken()
 	if err != nil {
-		log.Fatalf("Failed to create speaker research session: %v", err)
+		fatalf("Error obtaining Azure access token: %v", err)
 	}
 
-	researchPrompt := fmt.Sprintf(
-		"Research the following speaker and build a comprehensive profile: %s",
-		speakerName,
+	endpoint := fmt.Sprintf("https://%s/openai/deployments/%s/images/edits?api-version=%s",
+		resourceHost, deployment, apiVersion)
+
+	fmt.Printf("Using image edits endpoint (api-version: %s)...\n", apiVersion)
+
+	// Collect image paths: background first (if provided), then foreground.
+	images := []string{}
+	if *bgImage != "" {
+		images = append(images, *bgImage)
+	}
+	images = append(images, *inputImage)
+
+	body, contentType, err := buildMultipartBody(images, *prompt, *size)
+	if err != nil {
+		fatalf("Error building request: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, body)
+	if err != nil {
+		fatalf("Error creating HTTP request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", contentType)
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		fatalf("Error sending request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fatalf("Error reading response: %v", err)
+	}
+
+	var result imageEditResponse
+	if err := json.Unmarshal(respBytes, &result); err != nil {
+		fatalf("Error parsing response JSON: %v\nRaw (first 500 bytes): %s", err, truncate(string(respBytes), 500))
+	}
+
+	if result.Error != nil {
+		fatalf("Image edit failed: %s (type=%s, code=%s)", result.Error.Message, result.Error.Type, result.Error.Code)
+	}
+
+	if len(result.Data) == 0 || result.Data[0].B64JSON == "" {
+		fatalf("Image edit failed: no image data in response")
+	}
+
+	imageBytes, err := base64.StdEncoding.DecodeString(result.Data[0].B64JSON)
+	if err != nil {
+		fatalf("Error decoding base64 image: %v", err)
+	}
+
+	if err := os.WriteFile(outputFile, imageBytes, 0o644); err != nil {
+		fatalf("Error writing output file: %v", err)
+	}
+
+	fmt.Println("✅ Image edit successful")
+	fmt.Printf("Image saved to %s\n", outputFile)
+	fmt.Printf("Size: %.2f MB\n", float64(len(imageBytes))/(1024*1024))
+}
+
+// deriveOutputPath returns the output file path by appending "_generated"
+// before the file extension.
+// Example: "assets/cat.png" → "assets/cat_generated.png"
+func deriveOutputPath(input string) string {
+	dir := filepath.Dir(input)
+	ext := filepath.Ext(input)
+	name := strings.TrimSuffix(filepath.Base(input), ext)
+	return filepath.Join(dir, name+"_generated"+ext)
+}
+
+// getAzureToken shells out to `az account get-access-token` to retrieve a
+// bearer token for the Cognitive Services resource.
+func getAzureToken() (string, error) {
+	cmd := exec.Command("az", "account", "get-access-token",
+		"--resource", "https://cognitiveservices.azure.com",
+		"--query", "accessToken",
+		"-o", "tsv",
 	)
-
-	speakerProfile, err := waitForResponse(speakerSession, researchPrompt)
+	out, err := cmd.Output()
 	if err != nil {
-		log.Fatalf("Failed to get speaker research: %v", err)
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("az CLI failed: %s", string(exitErr.Stderr))
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// buildMultipartBody creates the multipart/form-data payload expected by the
+// Azure OpenAI /images/edits endpoint. Multiple images are sent as
+// repeated "image[]" fields.
+func buildMultipartBody(imagePaths []string, prompt, size string) (*bytes.Buffer, string, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+
+	// Add each image file. Use "image[]" when there are multiple images so
+	// the API receives them as an array; use "image" for a single file to
+	// stay compatible with the original behaviour.
+	fieldName := "image"
+	if len(imagePaths) > 1 {
+		fieldName = "image[]"
 	}
 
-	fmt.Println()
-	fmt.Println()
-	speakerSession.Destroy()
-
-	// ─── Step 2: Hand over to "marketing-superhero-connector" ───
-	fmt.Println("🦸 Step 2: Connecting speaker with superhero persona via marketing-superhero-connector agent...")
-	fmt.Println(strings.Repeat("─", 60))
-
-	superheroSession, err := client.CreateSession(ctx, &copilot.SessionConfig{
-		Streaming: true,
-		CustomAgents: []copilot.CustomAgentConfig{
-			{
-				Name:        "marketing-superhero-connector",
-				DisplayName: "Marketing Superhero Connector",
-				Description: "Takes a speaker profile and connects it with a superhero persona for creative marketing assets.",
-				Prompt: `You are a creative marketing superhero connector. Your job is to take a speaker's profile and create a unique superhero persona that embodies their expertise and speaking style.
-
-Given a speaker profile, you should:
-- Create a superhero name and alter ego inspired by the speaker's expertise
-- Design a superhero origin story that parallels their career journey
-- Define superpowers that map to their key skills and topics
-- Create a superhero catchphrase based on their speaking style
-- Suggest a visual style/costume concept that reflects their brand
-- Write a short marketing bio in the superhero persona
-- Suggest creative marketing assets that could be generated (social media posts, event banners, etc.)
-
-Be creative, fun, and professional. The output should be usable for actual marketing campaigns.`,
-			},
-		},
-	})
-	if err != nil {
-		log.Fatalf("Failed to create superhero connector session: %v", err)
+	for _, imagePath := range imagePaths {
+		if err := addImagePart(w, fieldName, imagePath); err != nil {
+			return nil, "", err
+		}
 	}
 
-	handoverPrompt := fmt.Sprintf(`Here is the complete speaker profile that was researched. Please create a superhero persona and marketing concept for this speaker:
-
---- SPEAKER PROFILE ---
-%s
---- END PROFILE ---
-
-Create the superhero persona and marketing assets based on this profile.`, speakerProfile)
-
-	_, err = waitForResponse(superheroSession, handoverPrompt)
-	if err != nil {
-		log.Fatalf("Failed to get superhero connection: %v", err)
+	// Add the remaining text fields.
+	for k, v := range map[string]string{
+		"prompt": prompt,
+		"n":      "1",
+		"size":   size,
+	} {
+		if err := w.WriteField(k, v); err != nil {
+			return nil, "", fmt.Errorf("writing field %s: %w", k, err)
+		}
 	}
 
-	fmt.Println()
-	fmt.Println()
-	superheroSession.Destroy()
+	if err := w.Close(); err != nil {
+		return nil, "", fmt.Errorf("closing multipart writer: %w", err)
+	}
 
-	fmt.Println(strings.Repeat("─", 60))
-	fmt.Printf("✅ Marketing profile complete for: %s\n", speakerName)
+	return &buf, w.FormDataContentType(), nil
+}
+
+// addImagePart adds a single image file as a multipart form part with the
+// correct MIME type.
+func addImagePart(w *multipart.Writer, fieldName, imagePath string) error {
+	file, err := os.Open(imagePath)
+	if err != nil {
+		return fmt.Errorf("opening image %s: %w", imagePath, err)
+	}
+	defer file.Close()
+
+	// Use the correct MIME type so the API doesn't reject with
+	// "unsupported mimetype ('application/octet-stream')".
+	mimeType := mime.TypeByExtension(filepath.Ext(imagePath))
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	partHeader := make(textproto.MIMEHeader)
+	partHeader.Set("Content-Disposition",
+		fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fieldName, filepath.Base(imagePath)))
+	partHeader.Set("Content-Type", mimeType)
+	part, err := w.CreatePart(partHeader)
+	if err != nil {
+		return fmt.Errorf("creating form file for %s: %w", imagePath, err)
+	}
+	if _, err := io.Copy(part, file); err != nil {
+		return fmt.Errorf("copying image data for %s: %w", imagePath, err)
+	}
+	return nil
+}
+
+// truncate returns at most n bytes of s.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// fatalf prints a message to stderr and exits with code 1.
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "❌ "+format+"\n", args...)
+	os.Exit(1)
 }
