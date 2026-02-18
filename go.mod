@@ -1,4 +1,4 @@
-module github.com/agentsleague/copilot-project
+module github.com/cloudnativelinz/marketing-asset-generator
 
 go 1.24
 
