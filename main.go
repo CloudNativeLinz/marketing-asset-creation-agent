@@ -23,6 +23,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -33,10 +34,12 @@ import (
 	"net/http"
 	"net/textproto"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 )
 
 // Azure resource configuration – keep in sync with the shell script.
@@ -177,22 +180,22 @@ func deriveOutputPath(input string) string {
 	return filepath.Join(dir, name+"_generated"+ext)
 }
 
-// getAzureToken shells out to `az account get-access-token` to retrieve a
-// bearer token for the Cognitive Services resource.
+// getAzureToken obtains a bearer token for the Cognitive Services resource
+// using DefaultAzureCredential, which automatically tries multiple
+// credential types (environment variables, managed identity, Azure CLI
+// token cache, etc.) without requiring the az CLI binary at runtime.
 func getAzureToken() (string, error) {
-	cmd := exec.Command("az", "account", "get-access-token",
-		"--resource", "https://cognitiveservices.azure.com",
-		"--query", "accessToken",
-		"-o", "tsv",
-	)
-	out, err := cmd.Output()
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("az CLI failed: %s", string(exitErr.Stderr))
-		}
-		return "", err
+		return "", fmt.Errorf("creating credential: %w", err)
 	}
-	return strings.TrimSpace(string(out)), nil
+	tk, err := cred.GetToken(context.Background(), policy.TokenRequestOptions{
+		Scopes: []string{"https://cognitiveservices.azure.com/.default"},
+	})
+	if err != nil {
+		return "", fmt.Errorf("acquiring token: %w", err)
+	}
+	return tk.Token, nil
 }
 
 // buildMultipartBody creates the multipart/form-data payload expected by the
