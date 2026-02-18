@@ -40,13 +40,14 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/joho/godotenv"
 )
 
-// Azure resource configuration – keep in sync with the shell script.
-const (
-	resourceHost = "cloudnativelinz-poland-resource.openai.azure.com"
-	deployment   = "gpt-image-1.5"
-	apiVersion   = "2025-04-01-preview"
+// Azure resource configuration – loaded from .env
+var (
+	resourceHost string
+	deployment   string
+	apiVersion   string
 )
 
 // imageEditResponse represents the JSON payload returned by the Azure
@@ -65,6 +66,19 @@ type apiError struct {
 }
 
 func main() {
+	if err := godotenv.Load(); err != nil {
+		// Just warn, don't fail, in case env vars are set directly
+		fmt.Println("No .env file found")
+	}
+
+	resourceHost = os.Getenv("AZURE_OPENAI_RESOURCE")
+	deployment = os.Getenv("AZURE_OPENAI_DEPLOYMENT")
+	apiVersion = os.Getenv("AZURE_OPENAI_API_VERSION")
+
+	if resourceHost == "" || deployment == "" || apiVersion == "" {
+		fatalf("Error: Environment variables AZURE_OPENAI_RESOURCE, AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_API_VERSION must be set")
+	}
+
 	prompt := flag.String("p", "", "The text prompt for image generation/editing (required)")
 	inputImage := flag.String("i", "", "The foreground input image file (required)")
 	bgImage := flag.String("b", "", "Background image file (optional)")
@@ -74,6 +88,17 @@ func main() {
 	if *prompt == "" {
 		fatalf("Error: Prompt is required (-p)\nUsage: generate -p PROMPT -i IMAGE [-b BACKGROUND] [-s SIZE]")
 	}
+
+	// Check if the prompt is a file path and read its content if so.
+	if fileInfo, err := os.Stat(*prompt); err == nil && !fileInfo.IsDir() {
+		content, err := os.ReadFile(*prompt)
+		if err != nil {
+			fatalf("Error reading prompt file: %v", err)
+		}
+		*prompt = string(content)
+		fmt.Printf("Loaded prompt from file: %s\n", fileInfo.Name())
+	}
+
 	if *inputImage == "" {
 		fatalf("Error: Input image is required (-i)\nUsage: generate -p PROMPT -i IMAGE [-b BACKGROUND] [-s SIZE]")
 	}

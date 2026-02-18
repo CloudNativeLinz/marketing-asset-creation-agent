@@ -11,14 +11,24 @@ A CLI tool built in Go that generates and edits marketing images using the [Azur
 ## Project Structure
 
 ```
-├── main.go               # Standalone version (inline prompt via -p flag)
-├── cmd/generate/main.go  # Prompt-file version (reads prompt from a file)
+├── main.go               # Application entry point
 ├── prompts/
 │   ├── event-prompt.md   # Prompt: composite a person onto a background image
 │   └── speaking-prompt.md# Prompt: apply pop-art style to an image
 ├── assets/               # Input images and generated outputs
 ├── Makefile              # Helpers (e.g. `make clean`)
+├── .env                  # Configuration file (created from .env.example)
 └── go.mod
+```
+
+## Configuration
+
+Create a `.env` file in the root directory with your Azure OpenAI details:
+
+```ini
+AZURE_OPENAI_RESOURCE=your-resource-name.openai.azure.com
+AZURE_OPENAI_DEPLOYMENT=gpt-image-1.5
+AZURE_OPENAI_API_VERSION=2025-04-01-preview
 ```
 
 ## Usage
@@ -26,7 +36,7 @@ A CLI tool built in Go that generates and edits marketing images using the [Azur
 ### Using a prompt file (recommended)
 
 ```bash
-go run ./cmd/generate \
+go run . \
   -p prompts/event-prompt.md \
   -i assets/juergen.jpg \
   -b assets/meetup-background.jpg \
@@ -46,7 +56,7 @@ go run . \
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `-p` | Yes | Text prompt (root `main.go`) **or** path to a prompt file (`cmd/generate`) |
+| `-p` | Yes | Text prompt **or** path to a prompt file |
 | `-i` | Yes | Foreground / input image file |
 | `-b` | No | Background image file (enables compositing) |
 | `-s` | No | Output image size (default: `1024x1024`) |
